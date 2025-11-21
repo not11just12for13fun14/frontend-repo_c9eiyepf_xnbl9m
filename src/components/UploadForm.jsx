@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { enqueue, loadQueue, saveQueue, addHistory, loadHistory } from '../lib/storage'
 
 const API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
@@ -7,6 +8,9 @@ function UploadForm({ session }) {
   const [file, setFile] = useState(null)
   const [notes, setNotes] = useState('')
   const [status, setStatus] = useState('')
+  const [syncing, setSyncing] = useState(false)
+  const queue = useMemo(() => loadQueue(), [status])
+  const history = useMemo(() => loadHistory(), [status])
 
   useEffect(() => {
     if (!('geolocation' in navigator)) return
@@ -29,12 +33,25 @@ function UploadForm({ session }) {
     reader.readAsDataURL(file)
   })
 
+  async function tryOnlineUpload(payload) {
+    const res = await fetch(`${API_BASE}/uploads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.detail || 'Upload failed')
+    }
+    return res.json()
+  }
+
   const handleUpload = async () => {
     if (!file || !coords) {
       setStatus('Please select a file and allow location access.')
       return
     }
-    setStatus('Uploading...')
+    setStatus('Preparing...')
     try {
       const b64 = await toBase64(file)
       const payload = {
@@ -49,16 +66,50 @@ function UploadForm({ session }) {
         captured_at: new Date().toISOString(),
         notes
       }
-      const res = await fetch(`${API_BASE}/uploads`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || 'Upload failed')
-      setStatus(`Uploaded ✓ (id: ${data.id})`)
+
+      setStatus('Uploading...')
+      try {
+        const data = await tryOnlineUpload(payload)
+        setStatus(`Uploaded ✓ (id: ${data.id})`)
+        addHistory({ id: data.id, notes, created_at: new Date().toISOString() })
+      } catch (e) {
+        enqueue({ ...payload, queued_at: new Date().toISOString() })
+        setStatus('Offline: saved locally. Will sync when online.')
+      }
+
+      setFile(null)
+      setNotes('')
     } catch (e) {
       setStatus(`Error: ${e.message}`)
+    }
+  }
+
+  const trySync = async () => {
+    const q = loadQueue()
+    if (!q.length) {
+      setStatus('Nothing to sync')
+      return
+    }
+    setSyncing(true)
+    setStatus('Syncing...')
+    try {
+      const res = await fetch(`${API_BASE}/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploads: q })
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Sync failed')
+
+      // on success, clear queue and add to history
+      saveQueue([])
+      const success = data.accepted || []
+      success.forEach((u) => addHistory({ id: u.id, notes: u.notes, created_at: u.created_at }))
+      setStatus(`Synced ${success.length} item(s) ✓`)
+    } catch (e) {
+      setStatus(`Sync error: ${e.message}`)
+    } finally {
+      setSyncing(false)
     }
   }
 
@@ -77,11 +128,39 @@ function UploadForm({ session }) {
               className="rounded-xl bg-slate-900 border border-white/10 text-white px-4 py-3" />
             <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Describe the asset"
               className="rounded-xl bg-slate-900 border border-white/10 text-white px-4 py-3 min-h-[100px]" />
-            <button onClick={handleUpload}
-              className="rounded-xl bg-blue-500 hover:bg-blue-600 text-white px-6 py-3 font-semibold w-fit">
-              Upload
-            </button>
+
+            <div className="flex flex-col sm:flex-row gap-3">
+              <button onClick={handleUpload}
+                className="rounded-xl bg-blue-500 hover:bg-blue-600 text-white px-6 py-3 font-semibold w-full sm:w-auto">
+                Upload
+              </button>
+              <button onClick={trySync} disabled={syncing}
+                className="rounded-xl bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 text-white px-6 py-3 font-semibold w-full sm:w-auto">
+                {syncing ? 'Syncing…' : 'Sync Offline Items'}
+              </button>
+            </div>
+
             {status && <p className="text-slate-300">{status}</p>}
+
+            {history.length > 0 && (
+              <div className="mt-6">
+                <div className="text-white font-semibold mb-2">Recent submissions</div>
+                <ul className="space-y-2">
+                  {history.map((h, i) => (
+                    <li key={i} className="text-sm text-slate-300 flex items-center justify-between bg-white/5 rounded-lg px-3 py-2">
+                      <span className="truncate">{h.notes || 'No notes'}</span>
+                      <span className="text-slate-400">{new Date(h.created_at).toLocaleString()}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {queue.length > 0 && (
+              <div className="mt-4 text-amber-300 text-sm">
+                {queue.length} item(s) waiting to sync
+              </div>
+            )}
           </div>
         </div>
       </div>
